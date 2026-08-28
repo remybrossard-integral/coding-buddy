@@ -168,7 +168,6 @@ function ensureCompanion(): Companion {
 
   checkAndAward(slot);
   trackActiveDay();
-  incrementEvent("sessions", 1);
   incrementEvent("buddies_collected", 1);
 
   return companion;

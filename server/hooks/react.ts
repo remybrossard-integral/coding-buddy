@@ -45,20 +45,29 @@ export interface ReactResult {
   updated: boolean;
 }
 
+/** Insertions above which a change also counts as a large diff. */
+const LARGE_DIFF_INSERTIONS = 80;
+
+/** A test run that reports any failure must not be read as all-green. */
+const TEST_FAILURE = /\b[1-9][0-9]* (failed|failing|errors?)\b|\bFAILED\b|✗|✘/i;
+
 const MATCHERS: ReadonlyArray<readonly [string, RegExp]> = [
   ["merge-conflict", /CONFLICT \(|Merge conflict in|both modified/i],
   ["commit", /[0-9]+ files? changed|\[[a-zA-Z_-]+ [a-f0-9]{7,}\]/i],
-  ["push", /To .+:|[0-9a-f]+\.\.[0-9a-f]+\s+\w+ -> \w+|Everything up-to-date|remote: Resolving deltas/i],
-  ["branch", /Switched to a new branch|Created branch|onto a new branch/i],
+  // Anchored to a real push destination: "To github.com:org/repo.git", not prose like "To fix this:".
+  ["push", /^To (?:https?:\/\/|git@|ssh:\/\/|[\w.-]+:)\S+|[0-9a-f]+\.\.[0-9a-f]+\s+\w+ -> \w+|Everything up-to-date|remote: Resolving deltas/im],
+  ["branch", /Switched to a new branch|Created branch|onto a new branch|Preparing worktree \(new branch/i],
   ["rebase", /Successfully rebased|Rebasing|[0-9]+ done/i],
   ["stash", /Saved working directory|Dropped .+ stash|stash@/i],
   ["tag", /tagged|v[0-9]+\.[0-9]+|tag:.*->/i],
   ["security-warning", /vulnerabilit|CVE-[0-9]{4}-[0-9]+|npm audit|found [0-9]+ vulnerabilities|in [0-9]+ scanned package/i],
   ["build-fail", /Build failed|Failed to compile|ERROR in |compilation error|Command failed with exit code/i],
   ["type-error", /TS[0-9]{4}:|Type .+ is not assignable|Argument of type|Cannot find name|Property .+ does not exist/i],
-  ["lint-fail", /✖|[0-9]+ problems? \([0-9]+ error|error:|warning:.+ ESLint|Ruff|flake8.*error|pylint.*error/i],
+  // Linter-specific: a bare "error:" belongs to the `error` matcher, not here.
+  ["lint-fail", /✖|[0-9]+ problems? \([0-9]+ error|warning:.+ ESLint|ruff (?:check|format)|Found [0-9]+ error|flake8.*error|pylint.*error/i],
   ["deprecation", /deprecat|will be removed in|is deprecated|DEPRECATED/i],
-  ["all-green", /all [0-9]+ tests passed|0 failures|100% passed|all [0-9]+ passed/i],
+  // Trailing alternatives cover pytest, vitest/jest and cargo; TEST_FAILURE guards them.
+  ["all-green", /all [0-9]+ tests passed|0 failures|100% passed|all [0-9]+ passed|\b[0-9]+ passed\b|test result: ok\./i],
   ["deploy", /deployed to|Deployment complete|Published to|vercel.*ready|netlify.*deployed/i],
   ["release", /npm publish|gh release create|Published.*to.*registry/i],
   ["coverage", /Coverage:.*[0-9]+%|All files.*\|.*[0-9]+%/i],
@@ -85,14 +94,21 @@ export function classifyToolResponse(result: string): Classification | undefined
       return { files: String((result.match(/Merge conflict in .*/gi) ?? []).length), reason };
     }
     if (reason === "commit") {
-      return { files: result.match(/[0-9]+ files? changed/i)?.[0]?.match(/[0-9]+/)?.[0], reason };
+      const files = result.match(/[0-9]+ files? changed/i)?.[0]?.match(/[0-9]+/)?.[0];
+      const lines = result.match(/[0-9]+ insertions/i)?.[0]?.match(/[0-9]+/)?.[0];
+      if (lines) return { files, lines, reason };
+      return { files, reason };
     }
     if (reason === "branch") {
       return { branch: result.match(/'([^']+)'/)?.[1], reason };
     }
+    if (reason === "all-green") {
+      if (TEST_FAILURE.test(result)) continue;
+      return { reason };
+    }
     if (reason === "large-diff") {
       const lines = result.match(/[0-9]+ insertions/i)?.[0]?.match(/[0-9]+/)?.[0];
-      return lines && Number(lines) > 80 ? { lines, reason } : { reason: "" };
+      return lines && Number(lines) > LARGE_DIFF_INSERTIONS ? { lines, reason } : { reason: "" };
     }
     return { reason };
   }
@@ -246,8 +262,10 @@ export function handleReact(rawInput: string, runtime: HookRuntime = {}): ReactR
   const sid = resolveHookSessionId(runtime);
   const clock = hookClock(runtime);
   const sessionStartFile = join(stateDir, `.session_start.${sid}`);
-  if (!fileExists(sessionStartFile) && fileExists(stateDir)) {
+  const newSession = !fileExists(sessionStartFile) && fileExists(stateDir);
+  if (newSession) {
     writeFileSync(sessionStartFile, String(clock.nowSeconds));
+    (runtime.spawnDetached ?? defaultSpawnDetached(runtime))("server/track-session.ts", []);
   }
   const sessionStart = fileExists(sessionStartFile)
     ? Number.parseInt(readFileSync(sessionStartFile, "utf8").trim(), 10)
@@ -392,6 +410,12 @@ export function handleReact(rawInput: string, runtime: HookRuntime = {}): ReactR
   const xpEvent = updateEvents(stateDir, reason);
   const spawnDetached = runtime.spawnDetached ?? defaultSpawnDetached(runtime);
   if (xpEvent) spawnDetached("server/award-xp.ts", [xpEvent]);
+
+  // A commit is the only place git reports insertions, so it also carries the large-diff signal.
+  if (reason === "commit" && Number(classification?.lines ?? 0) > LARGE_DIFF_INSERTIONS) {
+    const diffXpEvent = updateEvents(stateDir, "large-diff");
+    if (diffXpEvent) spawnDetached("server/award-xp.ts", [diffXpEvent]);
+  }
   const moodTrigger: Readonly<Record<string, string>> = {
     "test-fail": "tests_fail",
     error: "error",
