@@ -47,22 +47,69 @@ SID="$BUDDY_SID"
 
 [ -f "$STATE" ] || exit 0
 
-MUTED=$(jq -r '.muted // false' "$STATE" 2>/dev/null)
+# Read one field per line into the named array. jq on Windows terminates lines
+# with CRLF and mapfile -t strips only the newline, so trim the carriage return
+# before any caller treats a field as a number.
+_jq_fields() {
+    local -n _fields="$1"
+    local _i
+    mapfile -t _fields
+    for _i in "${!_fields[@]}"; do
+        _fields[$_i]="${_fields[$_i]%$'\r'}"
+    done
+}
+
+# Every status field in one jq pass. A fork costs 100-400ms under Git Bash, so
+# one read per field made the render cost more than the whole refresh interval.
+_jq_fields _STATUS < <(jq -r '[
+    (.muted // false), (.name // ""), (.rarity // "common"), (.stars // ""),
+    (.shiny // false), (.achievement // ""),
+    (if has("achievementAt") then (.achievementAt // 0) else "absent" end),
+    (.level // 1), (.mood // "focused")
+] | .[] | tostring' "$STATE" 2>/dev/null)
+
+MUTED="${_STATUS[0]:-false}"
 [ "$MUTED" = "true" ] && exit 0
 
-NAME=$(jq -r '.name // ""' "$STATE" 2>/dev/null)
+NAME="${_STATUS[1]:-}"
 [ -z "$NAME" ] && exit 0
 
-RARITY=$(jq -r '.rarity // "common"' "$STATE" 2>/dev/null)
-STARS=$(jq -r '.stars // ""' "$STATE" 2>/dev/null)
-SHINY=$(jq -r '.shiny // false' "$STATE" 2>/dev/null)
-REACTION_FILE="$BUDDY_STATE_DIR/reaction.$SID.json"
-ACHIEVEMENT=$(jq -r '.achievement // ""' "$STATE" 2>/dev/null)
+RARITY="${_STATUS[2]:-common}"
+STARS="${_STATUS[3]:-}"
+SHINY="${_STATUS[4]:-false}"
+ACHIEVEMENT="${_STATUS[5]:-}"
 # "absent" distinguishes a legacy status.json (no field at all) from an explicit
 # 0, which means "no achievement pending" and must not render.
-ACHIEVEMENT_AT=$(jq -r 'if has("achievementAt") then (.achievementAt // 0) else "absent" end' "$STATE" 2>/dev/null)
-LEVEL=$(jq -r '.level // 1' "$STATE" 2>/dev/null)
-MOOD=$(jq -r '.mood // "focused"' "$STATE" 2>/dev/null)
+ACHIEVEMENT_AT="${_STATUS[6]:-absent}"
+LEVEL="${_STATUS[7]:-1}"
+MOOD="${_STATUS[8]:-focused}"
+REACTION_FILE="$BUDDY_STATE_DIR/reaction.$SID.json"
+
+# Same single-pass treatment for config.json, read here once instead of in the
+# three blocks further down that each used to fork their own jq.
+CFG_THEME="auto"
+CFG_RAINBOW=""
+CFG_TTL=900
+CFG_BUBBLE_W=44
+CFG_MARGIN=8
+CFG_WIDTH_ADJUST=0
+CFG_DENSITY="auto"
+if [ -f "$CONFIG_FILE" ]; then
+    _jq_fields _CFG < <(jq -r '[
+        (.theme // "auto"), ((.rainbowColors // []) | join(" ")),
+        (.reactionTTL // 900), (.bubbleWidth // 44), (.bubbleMargin // 8),
+        (.statuslineWidthAdjust // 0), (.statuslineDensity // "auto")
+    ] | .[] | tostring' "$CONFIG_FILE" 2>/dev/null)
+    if [ "${#_CFG[@]}" -eq 7 ]; then
+        CFG_THEME="${_CFG[0]}"
+        CFG_RAINBOW="${_CFG[1]}"
+        CFG_TTL="${_CFG[2]}"
+        CFG_BUBBLE_W="${_CFG[3]}"
+        CFG_MARGIN="${_CFG[4]}"
+        CFG_WIDTH_ADJUST="${_CFG[5]}"
+        CFG_DENSITY="${_CFG[6]}"
+    fi
+fi
 
 BUDDY_STATUSLINE_INPUT=$(cat)
 
@@ -72,10 +119,7 @@ NOW=${BUDDY_FAKE_NOW:-$(date +%s)}
 
 # ─── Rarity color (theme-aware) ─────────────────────────────────────────────
 _THEME="dark"
-if [ -f "$CONFIG_FILE" ]; then
-    _cfg_theme=$(jq -r '.theme // "auto"' "$CONFIG_FILE" 2>/dev/null)
-    [ "$_cfg_theme" = "light" ] && _THEME="light"
-fi
+[ "$CFG_THEME" = "light" ] && _THEME="light"
 
 NC=$'\033[0m'
 NEUTRAL=$'\033[39m'
@@ -112,14 +156,11 @@ RAINBOW=(
   $'\033[38;2;180;50;220m'
 )
 
-if [ -f "$CONFIG_FILE" ]; then
-    _custom=$(jq -r '(.rainbowColors // []) | @tsv' "$CONFIG_FILE" 2>/dev/null)
-    if [ -n "$_custom" ]; then
-        RAINBOW=()
-        for _hex in $_custom; do
-            RAINBOW+=("$(_hex_to_ansi "$_hex")")
-        done
-    fi
+if [ -n "$CFG_RAINBOW" ]; then
+    RAINBOW=()
+    for _hex in $CFG_RAINBOW; do
+        RAINBOW+=("$(_hex_to_ansi "$_hex")")
+    done
 fi
 
 COLOR_ENABLED=1
@@ -240,27 +281,23 @@ REACTION_TTL=900
 INNER_W=44
 MARGIN=8
 DENSITY="auto"
-if [ -f "$CONFIG_FILE" ]; then
-    _ttl=$(jq -r '.reactionTTL // 900' "$CONFIG_FILE" 2>/dev/null || echo 900)
-    case "$_ttl" in ''|*[!0-9]*) ;; *) REACTION_TTL="$_ttl" ;; esac
-    _bw=$(jq -r '.bubbleWidth // 44' "$CONFIG_FILE" 2>/dev/null || echo 44)
-    case "$_bw" in ''|*[!0-9]*) ;; *) INNER_W="$_bw" ;; esac
-    _bm=$(jq -r '.bubbleMargin // 8' "$CONFIG_FILE" 2>/dev/null || echo 8)
-    case "$_bm" in ''|*[!0-9]*) ;; *) MARGIN="$_bm" ;; esac
-    _wa=$(jq -r '.statuslineWidthAdjust // 0' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    if printf '%s' "$_wa" | grep -Eq '^[+-]?[0-9]+$'; then
-        case "$_wa" in
-            +*) STATUSLINE_WIDTH_ADJUST=$((10#${_wa#+})) ;;
-            -*) STATUSLINE_WIDTH_ADJUST=$((-10#${_wa#-})) ;;
-            *)  STATUSLINE_WIDTH_ADJUST=$((10#$_wa)) ;;
-        esac
-    fi
-    _density=$(jq -r '.statuslineDensity // "auto"' "$CONFIG_FILE" 2>/dev/null || echo "auto")
-    case "$_density" in
-        auto|full|compact|minimal) DENSITY="$_density" ;;
-        *) DENSITY="auto" ;;
-    esac
-fi
+case "$CFG_TTL" in ''|*[!0-9]*) ;; *) REACTION_TTL="$CFG_TTL" ;; esac
+case "$CFG_BUBBLE_W" in ''|*[!0-9]*) ;; *) INNER_W="$CFG_BUBBLE_W" ;; esac
+case "$CFG_MARGIN" in ''|*[!0-9]*) ;; *) MARGIN="$CFG_MARGIN" ;; esac
+_wa="$CFG_WIDTH_ADJUST"
+_wa_sign=1
+case "$_wa" in
+    -*) _wa_sign=-1; _wa="${_wa#-}" ;;
+    +*) _wa="${_wa#+}" ;;
+esac
+case "$_wa" in
+    ''|*[!0-9]*) ;;
+    *) STATUSLINE_WIDTH_ADJUST=$(( _wa_sign * 10#$_wa )) ;;
+esac
+case "$CFG_DENSITY" in
+    auto|full|compact|minimal) DENSITY="$CFG_DENSITY" ;;
+    *) DENSITY="auto" ;;
+esac
 # ─── Statusline density tier ─────────────────────────────────────────────────
 # Explicit config/env density overrides pin the tier; otherwise rows drive it:
 #   full >= 40, compact 20-39, minimal < 20. Very narrow terminals also force minimal.
@@ -326,7 +363,7 @@ if [ -n "$ACHIEVEMENT" ] && [ "$ACHIEVEMENT" != "null" ]; then
             ''|0|*[!0-9]*) ACH_FRESH=0 ;;
             *)
                 if [ "$REACTION_TTL" -gt 0 ] 2>/dev/null; then
-                    ACH_AGE=$(( ($(date +%s) * 1000 - ACHIEVEMENT_AT) / 1000 ))
+                    ACH_AGE=$(( (NOW * 1000 - ACHIEVEMENT_AT) / 1000 ))
                     [ "$ACH_AGE" -ge "$REACTION_TTL" ] && ACH_FRESH=0
                 fi
                 ;;
@@ -335,15 +372,16 @@ if [ -n "$ACHIEVEMENT" ] && [ "$ACHIEVEMENT" != "null" ]; then
     [ "$ACH_FRESH" -eq 1 ] && BUBBLE=$'\xf0\x9f\x8f\x86'" $ACHIEVEMENT"
 fi
 
-REACTION=$(jq -r '.reaction // ""' "$REACTION_FILE" 2>/dev/null)
-if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; then
+_jq_fields _REACT < <(jq -r '[(.reaction // ""), (.timestamp // 0)] | .[] | tostring' \
+    "$REACTION_FILE" 2>/dev/null)
+REACTION="${_REACT[0]:-}"
+if [ -n "$REACTION" ] && [ "$REACTION" != "null" ]; then
     FRESH=0
     if [ "$REACTION_TTL" -eq 0 ]; then
         FRESH=1
-    elif [ -f "$REACTION_FILE" ]; then
-        TS=$(jq -r '.timestamp // 0' "$REACTION_FILE" 2>/dev/null || echo 0)
+    else
+        TS="${_REACT[1]:-0}"
         if [ "$TS" != "0" ]; then
-            NOW=$(date +%s)
             AGE=$(( (NOW * 1000 - TS) / 1000 ))
             [ "$AGE" -lt "$REACTION_TTL" ] && FRESH=1
         fi
@@ -449,109 +487,108 @@ EMOJI_PRES_2600="$(grep -v '^#' "$EMOJI_WIDTHS_DATA" 2>/dev/null | tr -d '\n')"
 EMOJI_TEXT_DATA="$(dirname "${BASH_SOURCE[0]}")/emoji-text.data"
 EMOJI_TEXT="$(grep -v '^#' "$EMOJI_TEXT_DATA" 2>/dev/null | tr -d '\n')"
 
-dwidth() {
-    printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
-    function load_ranges(value, target,    n, i, count, piece, bounds, start, end, cp) {
-        n = split(value, ranges, ",")
-        for (i = 1; i <= n; i++) {
-            count = split(ranges[i], bounds, "-")
-            start = bounds[1] + 0
-            end = (count == 2) ? bounds[2] + 0 : start
-            for (cp = start; cp <= end; cp++) target[cp] = 1
-        }
+# One awk program serves both entry points. Records are separated by newline
+# codepoints inside the UTF-32 stream, so a whole batch of strings costs one
+# iconv/od/awk pipeline instead of one per string — the difference between a
+# 70-second render and a sub-second one on Git Bash.
+_DW_AWK='
+function load_ranges(value, target,    n, i, count, bounds, start, end, cp) {
+    n = split(value, ranges, ",")
+    for (i = 1; i <= n; i++) {
+        count = split(ranges[i], bounds, "-")
+        start = bounds[1] + 0
+        end = (count == 2) ? bounds[2] + 0 : start
+        for (cp = start; cp <= end; cp++) target[cp] = 1
     }
-    BEGIN {
-        load_ranges(pres, wide)
-        load_ranges(text, text_default)
+}
+function char_width(cp) {
+    if (cp in wide) return 2
+    if (cp >= 9472 && cp <= 9631) return 1
+    if (cp >= 12288 && cp <= 40959) return 2
+    if (cp >= 65281 && cp <= 65376) return 2
+    return 1
+}
+# profile=0 prints one total per record; profile=1 prints one width per
+# codepoint and a blank line to close the record.
+function flush_record() {
+    if (profile) {
+        for (j = 1; j <= idx; j++) print widths[j] + 0
+        print ""
+    } else {
+        print w + 0
     }
-    # Precondition: cp is neither a variation selector (65024-65039) nor ZWJ
-    # (8205); the main loop filters those before calling in.
-    function char_width(cp) {
-        if (cp in wide) return 2
-        if (cp >= 9472 && cp <= 9631) return 1
-        if (cp >= 12288 && cp <= 40959) return 2
-        if (cp >= 65281 && cp <= 65376) return 2
-        return 1
-    }
-    { for (i = 1; i <= NF; i++) {
+    delete widths
+    idx = 0
+    w = 0
+    upgradable = 0
+}
+BEGIN {
+    load_ranges(pres, wide)
+    load_ranges(text, text_default)
+}
+{
+    for (i = 1; i <= NF; i++) {
         cp = $i + 0
+        if (cp == 10) { flush_record(); continue }
+        idx++
+        # VS16 upgrades the preceding narrow emoji to 2 cols (e.g. ❤ + VS16)
+        # and occupies no column of its own; ZWJ and the other variation
+        # selectors are likewise zero-width.
         if (cp == 65039) {
-            if (upgradable) { w += 1; upgradable = 0 }
+            if (upgradable) { w += 1; if (idx > 1) widths[idx - 1] += 1 }
+            widths[idx] = 0
+            upgradable = 0
             continue
         }
-        if ((cp >= 65024 && cp <= 65038) || cp == 8205) { upgradable = 0; continue }
+        if ((cp >= 65024 && cp <= 65038) || cp == 8205) {
+            widths[idx] = 0
+            upgradable = 0
+            continue
+        }
         cw = char_width(cp)
         w += cw
+        widths[idx] = cw
         upgradable = 0
         if (cw == 1 && (cp in text_default)) upgradable = 1
-    } }
-    END { print w+0 }'
+    }
 }
-# Emit one display-width value per UTF-8 codepoint. ANSI-aware truncation uses
-# this profile to make one Unicode-width pass over the complete output row.
-dwidth_profile() {
-    printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
-    function load_ranges(value, target,    n, i, count, piece, bounds, start, end, cp) {
-        n = split(value, ranges, ",")
-        for (i = 1; i <= n; i++) {
-            count = split(ranges[i], bounds, "-")
-            start = bounds[1] + 0
-            end = (count == 2) ? bounds[2] + 0 : start
-            for (cp = start; cp <= end; cp++) target[cp] = 1
-        }
-    }
-    BEGIN {
-        load_ranges(pres, wide)
-        load_ranges(text, text_default)
-    }
-    function char_width(cp) {
-        if (cp in wide) return 2
-        if (cp >= 9472 && cp <= 9631) return 1
-        if (cp >= 12288 && cp <= 40959) return 2
-        if (cp >= 65281 && cp <= 65376) return 2
-        return 1
-    }
-    {
-        for (j = 1; j <= NF; j++) {
-            cp = $j + 0
-            idx++
-            if (cp == 65039) {
-                if (upgradable && idx > 1) widths[idx - 1] += 1
-                widths[idx] = 0
-                upgradable = 0
-                continue
-            }
-            if ((cp >= 65024 && cp <= 65038) || cp == 8205) {
-                widths[idx] = 0
-                upgradable = 0
-                continue
-            }
-            cw = char_width(cp)
-            widths[idx] = cw
-            upgradable = 0
-            if (cw == 1 && (cp in text_default)) upgradable = 1
-        }
-    }
-    END {
-        for (j = 1; j <= idx; j++) print widths[j] + 0
-    }'
-}
-ART_W=0
-for line in "${ART_LINES[@]}"; do
-    line_w=$(dwidth "$line")
-    [ "$line_w" -gt "$ART_W" ] && ART_W="$line_w"
-done
+'
 
-# Keep the label inside the same sprite column as the art. The exact Unicode
-# width rules live in dwidth(), so the shell and TS renderers agree on bounds.
-LABEL_W=$(dwidth "$NAME_WITH_LEVEL")
+# Display width of every string on stdin, one per line, in order. Callers must
+# terminate each string with a newline; the awk records depend on it.
+dwidth_many() {
+    iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 \
+        | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" -v profile=0 "$_DW_AWK"
+}
+
+dwidth() {
+    printf '%s\n' "$1" | dwidth_many
+}
+
+# Per-codepoint widths for every string on stdin: one width per line, a blank
+# line closing each string. ANSI-aware truncation walks these to find its cut.
+dwidth_profile_many() {
+    iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 \
+        | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" -v profile=1 "$_DW_AWK"
+}
+# Art rows, label and name line measured together. Keep the label inside the
+# same sprite column as the art; the exact Unicode width rules live in the
+# shared awk program, so the shell and TS renderers agree on bounds.
+mapfile -t _ART_WIDTHS < <(printf '%s\n' "${ART_LINES[@]}" "$NAME_WITH_LEVEL" "$NAME_LINE" \
+    | dwidth_many)
+ART_W=0
+for _i in "${!ART_LINES[@]}"; do
+    [ "${_ART_WIDTHS[$_i]:-0}" -gt "$ART_W" ] && ART_W="${_ART_WIDTHS[$_i]}"
+done
+LABEL_W="${_ART_WIDTHS[${#ART_LINES[@]}]:-0}"
+NAME_LINE_W="${_ART_WIDTHS[$(( ${#ART_LINES[@]} + 1 ))]:-0}"
 if [ "$LABEL_W" -gt "$ART_W" ] 2>/dev/null; then
     ART_W="$LABEL_W"
     NAME_PAD=$(( (ART_W - LABEL_W) / 2 ))
     NAME_LINE="$(printf '%*s%s' "$NAME_PAD" '' "$NAME_WITH_LEVEL")"
     ALL_LINES[$(( ART_COUNT - 1 ))]="$NAME_LINE"
+    NAME_LINE_W=$(dwidth "$NAME_LINE")
 fi
-NAME_LINE_W=$(dwidth "$NAME_LINE")
 # Centering the name against a short fixture frame can make the label wider
 # than every art row; include that width before sizing the card.
 [ "$NAME_LINE_W" -gt "$ART_W" ] && ART_W="$NAME_LINE_W"
@@ -632,22 +669,27 @@ fi
 
 # ─── Word-wrap bubble text ────────────────────────────────────────────────────
 TEXT_LINES=()
+# Width of each wrapped line, carried out of the loop so the padding pass below
+# never re-measures a string this loop already added up.
+TEXT_WIDTHS=()
 if [ -n "$BUBBLE_TEXT" ]; then
     read -r -a WORDS <<< "$BUBBLE_TEXT"
+    mapfile -t WORD_WIDTHS < <(printf '%s\n' "${WORDS[@]}" | dwidth_many)
     CUR_LINE=""
     CUR_W=0
-    for word in "${WORDS[@]}"; do
-        word_w=$(dwidth "$word")
+    for _wi in "${!WORDS[@]}"; do
+        word="${WORDS[$_wi]}"
+        word_w="${WORD_WIDTHS[$_wi]:-0}"
         if [ -z "$CUR_LINE" ]; then
             CUR_LINE="$word"; CUR_W=$word_w
         elif [ $(( CUR_W + 1 + word_w )) -le $INNER_W ]; then
             CUR_LINE="$CUR_LINE $word"; CUR_W=$(( CUR_W + 1 + word_w ))
         else
-            TEXT_LINES+=("$CUR_LINE")
+            TEXT_LINES+=("$CUR_LINE"); TEXT_WIDTHS+=("$CUR_W")
             CUR_LINE="$word"; CUR_W=$word_w
         fi
     done
-    [ -n "$CUR_LINE" ] && TEXT_LINES+=("$CUR_LINE")
+    [ -n "$CUR_LINE" ] && { TEXT_LINES+=("$CUR_LINE"); TEXT_WIDTHS+=("$CUR_W"); }
 fi
 
 TEXT_COUNT=${#TEXT_LINES[@]}
@@ -663,8 +705,9 @@ if [ $TEXT_COUNT -gt 0 ]; then
     BUBBLE_LINES+=(".${BORDER}.")
     BUBBLE_TYPES+=("border")
     # Text rows: "| text padded |"
-    for tl in "${TEXT_LINES[@]}"; do
-        tpad=$(( INNER_W - $(dwidth "$tl") ))
+    for _ti in "${!TEXT_LINES[@]}"; do
+        tl="${TEXT_LINES[$_ti]}"
+        tpad=$(( INNER_W - ${TEXT_WIDTHS[$_ti]:-0} ))
         [ "$tpad" -lt 0 ] && tpad=0
         padding=$(printf '%*s' "$tpad" '')
         BUBBLE_LINES+=("| ${tl}${padding} |")
@@ -763,27 +806,19 @@ for (( i=0; i<MAX_LINES; i++ )); do
     fi
 done
 
-ansi_truncate() {
+# Strip SGR from a row, into globals so callers avoid a command substitution.
+# _SGR_PLAIN carries the visible text, _SGR_SEEN whether any escape was found.
+_strip_sgr() {
     local text="$1"
-    local max_width="$2"
-    local out=""
-    local plain=""
+    local text_len=${#1}
     local i=0
-    local text_len=${#text}
-    local char seq char_width truncated=0 saw_sgr=0
-    local visible_width=0
-    local -a widths
-    local visible_index=0
-
-    [ "$max_width" -lt 0 ] && max_width=0
-
-    # Strip SGR while building the one string sent to dwidth_profile. The
-    # profile uses one iconv/od/awk pass for the whole row; never spawn a
-    # subprocess for each Unicode character.
+    local char
+    _SGR_PLAIN=""
+    _SGR_SEEN=0
     while [ "$i" -lt "$text_len" ]; do
         char="${text:$i:1}"
         if [ "$char" = $'\033' ]; then
-            saw_sgr=1
+            _SGR_SEEN=1
             i=$(( i + 1 ))
             while [ "$i" -lt "$text_len" ]; do
                 char="${text:$i:1}"
@@ -792,18 +827,52 @@ ansi_truncate() {
             done
             continue
         fi
-        plain="${plain}${char}"
+        _SGR_PLAIN="${_SGR_PLAIN}${char}"
         i=$(( i + 1 ))
     done
+}
 
-    widths=()
-    if [ -n "$plain" ]; then
-        while IFS= read -r char_width; do
-            widths+=("$char_width")
-        done < <(dwidth_profile "$plain")
-    fi
+# Codepoint widths for every output row in one iconv/od/awk pipeline. Measuring
+# per row cost a fork per row; the flat array plus per-row offsets keeps that at
+# one pipeline for the whole panel.
+ROW_PLAIN=()
+ROW_SGR_SEEN=()
+for line in "${OUTPUT_LINES[@]}"; do
+    _strip_sgr "$line"
+    ROW_PLAIN+=("$_SGR_PLAIN")
+    ROW_SGR_SEEN+=("$_SGR_SEEN")
+done
 
-    i=0
+ROW_WIDTHS=()
+ROW_WIDTH_OFFSET=(0)
+if [ "${#ROW_PLAIN[@]}" -gt 0 ]; then
+    _row=0
+    while IFS= read -r _w; do
+        if [ -z "$_w" ]; then
+            _row=$(( _row + 1 ))
+            ROW_WIDTH_OFFSET[$_row]=${#ROW_WIDTHS[@]}
+        else
+            ROW_WIDTHS+=("$_w")
+        fi
+    done < <(printf '%s\n' "${ROW_PLAIN[@]}" | dwidth_profile_many)
+fi
+
+# Truncate row $1 to $2 columns, reading its widths out of the batch above.
+ansi_truncate_row() {
+    local row="$1"
+    local max_width="$2"
+    local text="${OUTPUT_LINES[$row]}"
+    local out=""
+    local i=0
+    local text_len=${#text}
+    local char seq char_width truncated=0
+    local saw_sgr="${ROW_SGR_SEEN[$row]:-0}"
+    local base="${ROW_WIDTH_OFFSET[$row]:-0}"
+    local visible_width=0
+    local visible_index=0
+
+    [ "$max_width" -lt 0 ] && max_width=0
+
     while [ "$i" -lt "$text_len" ]; do
         char="${text:$i:1}"
         if [ "$char" = $'\033' ]; then
@@ -819,7 +888,7 @@ ansi_truncate() {
             continue
         fi
 
-        char_width="${widths[$visible_index]:-1}"
+        char_width="${ROW_WIDTHS[$(( base + visible_index ))]:-1}"
         if [ $(( visible_width + char_width )) -gt "$max_width" ]; then
             truncated=1
             break
@@ -831,16 +900,11 @@ ansi_truncate() {
     done
 
     [ "$truncated" -eq 1 ] && [ "$saw_sgr" -eq 1 ] && out="${out}${NC}"
-    printf '%s' "$out"
+    printf '%s\n' "$out"
 }
 
-statusline_output_line() {
-    ansi_truncate "$1" "$STATUSLINE_BUDGET"
-    printf '\n'
-}
-
-for line in "${OUTPUT_LINES[@]}"; do
-    statusline_output_line "$line"
+for _row in "${!OUTPUT_LINES[@]}"; do
+    ansi_truncate_row "$_row" "$STATUSLINE_BUDGET"
 done
 
 # Append the last cached sub-status result below the buddy panel and refresh
