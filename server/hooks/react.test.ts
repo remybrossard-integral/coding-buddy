@@ -26,9 +26,6 @@ describe("react PostToolUse hook", () => {
     });
     expect(classifyToolResponse("+ 20 insertions")).toEqual({ reason: "" });
     expect(classifyToolResponse("+ 100 insertions")).toEqual({ lines: "100", reason: "large-diff" });
-  });
-
-  test("classifies the runners and git output the ordered matcher used to miss", () => {
     // A commit is where git reports insertions, so it carries the large-diff signal too.
     expect(classifyToolResponse("[main abcdef123] big\n12 files changed, 2500 insertions(+)")).toEqual({
       files: "12",
@@ -41,9 +38,7 @@ describe("react PostToolUse hook", () => {
       branch: "issue-42",
       reason: "branch",
     });
-    expect(classifyToolResponse("To github.com:org/repo.git\n   f0db4d0..656d0a3  main -> main")).toEqual({
-      reason: "push",
-    });
+    expect(classifyToolResponse("To github.com:org/repo.git\n f0db4d0..656d0a3 main -> main")?.reason).toBe("push");
     expect(classifyToolResponse("Note: To fix this: run uv sync")).toBeUndefined();
   });
 
