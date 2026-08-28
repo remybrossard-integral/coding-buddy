@@ -26,6 +26,20 @@ describe("react PostToolUse hook", () => {
     });
     expect(classifyToolResponse("+ 20 insertions")).toEqual({ reason: "" });
     expect(classifyToolResponse("+ 100 insertions")).toEqual({ lines: "100", reason: "large-diff" });
+    // A commit is where git reports insertions, so it carries the large-diff signal too.
+    expect(classifyToolResponse("[main abcdef123] big\n12 files changed, 2500 insertions(+)")).toEqual({
+      files: "12",
+      lines: "2500",
+      reason: "commit",
+    });
+    expect(classifyToolResponse("===== 42 passed in 3.21s =====")).toEqual({ reason: "all-green" });
+    expect(classifyToolResponse("===== 1 failed, 41 passed in 3.21s =====")).toEqual({ reason: "test-fail" });
+    expect(classifyToolResponse("Preparing worktree (new branch 'issue-42')")).toEqual({
+      branch: "issue-42",
+      reason: "branch",
+    });
+    expect(classifyToolResponse("To github.com:org/repo.git\n f0db4d0..656d0a3 main -> main")?.reason).toBe("push");
+    expect(classifyToolResponse("Note: To fix this: run uv sync")).toBeUndefined();
   });
 
   test("writes a deterministic reaction, events, and slow-work spawns", () => {
@@ -58,6 +72,7 @@ describe("react PostToolUse hook", () => {
       errors_seen: 1,
     });
     expect(spawned).toEqual([
+      { script: "server/track-session.ts", args: [] },
       { script: "server/award-xp.ts", args: ["errors_spotted"] },
       { script: "server/shift-mood.ts", args: ["error"] },
     ]);
